@@ -692,6 +692,7 @@ async function fetchMagnet(relPath, id) {
   }
 }
 
+// ─── PATCHED: handleDownload returns magnet as body for torrent clients ───
 async function handleDownload(req, res, u) {
   const id = u.searchParams.get("id") || "";
   const relPath = u.searchParams.get("path") || "";
@@ -700,45 +701,68 @@ async function handleDownload(req, res, u) {
     return send(res, 400, "text/plain; charset=utf-8", "bad download parameters");
   }
 
-  const cached = getCache(magnetCache, id);
-  if (cached) {
-    log("[cache] magnet hit", id);
-    const safe = sanitizeMagnet(cached);
-    log("[download] safe length=", safe.length, "preview=", safe.slice(0, 100));
-    res.writeHead(302, {
-      Location: safe,
-      "cache-control": "private, max-age=86400"
-    });
-    return res.end();
-  }
+  const accept = String(req.headers.accept || "").toLowerCase();
+  const isBrowser = accept.includes("text/html") && !accept.includes("application/x-bittorrent");
 
-  const magnet = await withFsLock(async () => {
-    const cachedAgain = getCache(magnetCache, id);
-    if (cachedAgain) {
-      log("[cache] magnet hit after wait", id);
-      return cachedAgain;
+  const cached = getCache(magnetCache, id);
+
+  async function getMagnetString() {
+    if (cached) {
+      log("[cache] magnet hit", id);
+      return sanitizeMagnet(cached);
     }
 
-    log("[flaresolverr] magnet fetch", id);
-    const m = await fetchMagnet(relPath, id);
+    return await withFsLock(async () => {
+      const cachedAgain = getCache(magnetCache, id);
+      if (cachedAgain) {
+        log("[cache] magnet hit after wait", id);
+        return sanitizeMagnet(cachedAgain);
+      }
 
-    setLimitedCache(magnetCache, id, m,
-      Number(config.maxMagnetCacheItems || 1000),
-      Number(config.magnetTtlMinutes || 1440) * 60 * 1000);
+      log("[flaresolverr] magnet fetch", id);
+      const m = await fetchMagnet(relPath, id);
 
-    log("[cache] magnet stored", id);
-    return m;
-  });
+      setLimitedCache(magnetCache, id, m,
+        Number(config.maxMagnetCacheItems || 1000),
+        Number(config.magnetTtlMinutes || 1440) * 60 * 1000);
 
-  const safe = sanitizeMagnet(magnet);
-  log("[download] safe length=", safe.length, "preview=", safe.slice(0, 100));
+      log("[cache] magnet stored", id);
+      return sanitizeMagnet(m);
+    });
+  }
 
-  res.writeHead(302, {
-    Location: safe,
-    "cache-control": "private, max-age=86400"
-  });
-  res.end();
+  try {
+    const safeMagnet = await getMagnetString();
+
+    if (!safeMagnet || !safeMagnet.startsWith("magnet:")) {
+      return send(res, 500, "text/plain; charset=utf-8", "invalid magnet");
+    }
+
+    log("[download] id=", id, "accept=", accept, "browser=", isBrowser);
+
+    if (isBrowser) {
+      // Browser: 302 redirect na magnet
+      res.writeHead(302, {
+        Location: safeMagnet,
+        "cache-control": "private, max-age=86400"
+      });
+      return res.end();
+    }
+
+    // Torrent klijent (Jackett, Elementum, Sonarr, Radarr): 200 s magnetom u tijelu
+    const body = safeMagnet + "\n";
+    res.writeHead(200, {
+      "content-type": "application/x-bittorrent",
+      "content-length": Buffer.byteLength(body),
+      "cache-control": "private, max-age=86400"
+    });
+    return res.end(body);
+  } catch (e) {
+    error("[download] failed for id=", id, e.message || e);
+    return send(res, 500, "text/plain; charset=utf-8", String(e.message || e));
+  }
 }
+// ─── END PATCH ───
 
 async function doWarm() {
   const start = Date.now();
@@ -939,9 +963,9 @@ function parseForm(body) {
     flaresolverrUrl: p.get("flaresolverrUrl"),
     sessionName: p.get("sessionName"),
     apiKey: p.get("apiKey"),
-    withAdult: boolFromForm(p.get("withAdult")),
-    stripSeasonFromSearch: boolFromForm(p.get("stripSeasonFromSearch")),
-    warmEnabled: boolFromForm(p.get("warmEnabled")),
+    withAdult: p.has("withAdult") ? boolFromForm(p.get("withAdult")) : config.withAdult,
+    stripSeasonFromSearch: p.has("stripSeasonFromSearch") ? boolFromForm(p.get("stripSeasonFromSearch")) : config.stripSeasonFromSearch,
+    warmEnabled: p.has("warmEnabled") ? boolFromForm(p.get("warmEnabled")) : config.warmEnabled,
     warmQuery: p.get("warmQuery"),
     warmIntervalMinutes: Number(p.get("warmIntervalMinutes") || 10),
     coldThresholdSeconds: Number(p.get("coldThresholdSeconds") || 30),
