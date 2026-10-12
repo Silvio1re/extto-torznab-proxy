@@ -102,7 +102,6 @@ function normalizeBaseUrl(s) {
   return String(s || "").replace(/\/+$/, "");
 }
 
-// ─── SANITIZE MAGNET: URL-encodira vrijednosti parametara (čuva naziv torrenta) ───
 function sanitizeMagnet(uri) {
   if (!uri || typeof uri !== "string" || !uri.startsWith("magnet:")) return uri;
   const qIndex = uri.indexOf("?");
@@ -126,7 +125,6 @@ function sanitizeMagnet(uri) {
   });
   return base + "?" + encoded.join("&");
 }
-// ─── END SANITIZE ───
 
 function xmlEscape(s) {
   return String(s ?? "")
@@ -614,7 +612,6 @@ function parseMagnetJson(text) {
   return JSON.parse(body);
 }
 
-// ─── PATCHED: magnet POST ide kroz FlareSolverr (zaobilazi Cloudflare) ───
 async function postMagnetDirect({ id, ts, hmac, csrf, referer, cookies, userAgent }) {
   const postData = new URLSearchParams({
     torrent_id: id,
@@ -646,7 +643,6 @@ async function postMagnetDirect({ id, ts, hmac, csrf, referer, cookies, userAgen
 
   return json;
 }
-// ─── END PATCH ───
 
 async function fetchMagnetOnce(relPath, id) {
   await ensureSession();
@@ -692,7 +688,6 @@ async function fetchMagnet(relPath, id) {
   }
 }
 
-// ─── PATCHED: handleDownload returns magnet as body for torrent clients ───
 async function handleDownload(req, res, u) {
   const id = u.searchParams.get("id") || "";
   const relPath = u.searchParams.get("path") || "";
@@ -741,7 +736,6 @@ async function handleDownload(req, res, u) {
     log("[download] id=", id, "accept=", accept, "browser=", isBrowser);
 
     if (isBrowser) {
-      // Browser: 302 redirect na magnet
       res.writeHead(302, {
         Location: safeMagnet,
         "cache-control": "private, max-age=86400"
@@ -749,8 +743,7 @@ async function handleDownload(req, res, u) {
       return res.end();
     }
 
-    // Torrent klijent (Jackett, Elementum, Sonarr, Radarr): 200 s magnetom u tijelu
-    const body = safeMagnet + "\n";
+    const body = safeMagnet;
     res.writeHead(200, {
       "content-type": "application/x-bittorrent",
       "content-length": Buffer.byteLength(body),
@@ -762,7 +755,6 @@ async function handleDownload(req, res, u) {
     return send(res, 500, "text/plain; charset=utf-8", String(e.message || e));
   }
 }
-// ─── END PATCH ───
 
 async function doWarm() {
   const start = Date.now();
