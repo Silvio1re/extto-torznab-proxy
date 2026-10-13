@@ -237,6 +237,14 @@ async function resetSession() {
   });
 }
 
+function cookiesToHeader(cookies) {
+  if (!Array.isArray(cookies)) return "";
+  return cookies
+    .filter(c => c && c.name && typeof c.value !== "undefined")
+    .map(c => `${c.name}=${c.value}`)
+    .join("; ");
+}
+
 function getUserAgent(solution) {
   return (
     solution &&
@@ -612,6 +620,7 @@ function parseMagnetJson(text) {
   return JSON.parse(body);
 }
 
+// ─── STARA VERZIJA: direktni fetch (bez FlareSolverr) ───
 async function postMagnetDirect({ id, ts, hmac, csrf, referer, cookies, userAgent }) {
   const postData = new URLSearchParams({
     torrent_id: id,
@@ -621,28 +630,36 @@ async function postMagnetDirect({ id, ts, hmac, csrf, referer, cookies, userAgen
     sessid: csrf
   }).toString();
 
-  const fsRes = await fsCall({
-    cmd: "request.post",
-    url: normalizeBaseUrl(config.baseUrl) + "/ajax/getTorrentMagnet.php",
-    session: config.sessionName,
-    postData: postData,
-    maxTimeout: Number(config.requestTimeoutMs || 120000)
+  const r = await fetch(normalizeBaseUrl(config.baseUrl) + "/ajax/getTorrentMagnet.php", {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "x-requested-with": "XMLHttpRequest",
+      "referer": referer,
+      "origin": normalizeBaseUrl(config.baseUrl),
+      "user-agent": userAgent,
+      "accept": "application/json, text/javascript, */*; q=0.01",
+      "cookie": cookiesToHeader(cookies)
+    },
+    body: postData
   });
 
-  const solution = fsRes && fsRes.solution ? fsRes.solution : {};
-  const text = solution.response || "";
-
-  if (!text) throw new Error("magnet ajax empty response");
+  const text = await r.text();
 
   let json;
   try {
     json = parseMagnetJson(text);
   } catch {
-    throw new Error("magnet ajax bad JSON: " + text.slice(0, 300));
+    throw new Error("magnet ajax bad JSON: HTTP " + r.status + " " + text.slice(0, 300));
+  }
+
+  if (!r.ok) {
+    throw new Error("magnet ajax HTTP " + r.status + ": " + text.slice(0, 300));
   }
 
   return json;
 }
+// ─── END STARA VERZIJA ───
 
 async function fetchMagnetOnce(relPath, id) {
   await ensureSession();
@@ -696,64 +713,39 @@ async function handleDownload(req, res, u) {
     return send(res, 400, "text/plain; charset=utf-8", "bad download parameters");
   }
 
-  const accept = String(req.headers.accept || "").toLowerCase();
-  const isBrowser = accept.includes("text/html") && !accept.includes("application/x-bittorrent");
-
   const cached = getCache(magnetCache, id);
-
-  async function getMagnetString() {
-    if (cached) {
-      log("[cache] magnet hit", id);
-      return sanitizeMagnet(cached);
-    }
-
-    return await withFsLock(async () => {
-      const cachedAgain = getCache(magnetCache, id);
-      if (cachedAgain) {
-        log("[cache] magnet hit after wait", id);
-        return sanitizeMagnet(cachedAgain);
-      }
-
-      log("[flaresolverr] magnet fetch", id);
-      const m = await fetchMagnet(relPath, id);
-
-      setLimitedCache(magnetCache, id, m,
-        Number(config.maxMagnetCacheItems || 1000),
-        Number(config.magnetTtlMinutes || 1440) * 60 * 1000);
-
-      log("[cache] magnet stored", id);
-      return sanitizeMagnet(m);
-    });
-  }
-
-  try {
-    const safeMagnet = await getMagnetString();
-
-    if (!safeMagnet || !safeMagnet.startsWith("magnet:")) {
-      return send(res, 500, "text/plain; charset=utf-8", "invalid magnet");
-    }
-
-    log("[download] id=", id, "accept=", accept, "browser=", isBrowser);
-
-    if (isBrowser) {
-      res.writeHead(302, {
-        Location: safeMagnet,
-        "cache-control": "private, max-age=86400"
-      });
-      return res.end();
-    }
-
-    const body = safeMagnet;
-    res.writeHead(200, {
-      "content-type": "application/x-bittorrent",
-      "content-length": Buffer.byteLength(body),
+  if (cached) {
+    log("[cache] magnet hit", id);
+    res.writeHead(302, {
+      Location: sanitizeMagnet(cached),
       "cache-control": "private, max-age=86400"
     });
-    return res.end(body);
-  } catch (e) {
-    error("[download] failed for id=", id, e.message || e);
-    return send(res, 500, "text/plain; charset=utf-8", String(e.message || e));
+    return res.end();
   }
+
+  const magnet = await withFsLock(async () => {
+    const cachedAgain = getCache(magnetCache, id);
+    if (cachedAgain) {
+      log("[cache] magnet hit after wait", id);
+      return cachedAgain;
+    }
+
+    log("[flaresolverr] magnet fetch", id);
+    const m = await fetchMagnet(relPath, id);
+
+    setLimitedCache(magnetCache, id, m,
+      Number(config.maxMagnetCacheItems || 1000),
+      Number(config.magnetTtlMinutes || 1440) * 60 * 1000);
+
+    log("[cache] magnet stored", id);
+    return m;
+  });
+
+  res.writeHead(302, {
+    Location: sanitizeMagnet(magnet),
+    "cache-control": "private, max-age=86400"
+  });
+  res.end();
 }
 
 async function doWarm() {
