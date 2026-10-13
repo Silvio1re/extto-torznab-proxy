@@ -102,6 +102,7 @@ function normalizeBaseUrl(s) {
   return String(s || "").replace(/\/+$/, "");
 }
 
+// ─── FIX 1: UVIJEK re-encode magnet vrijednosti (uklanja raw ćirilicu) ───
 function sanitizeMagnet(uri) {
   if (!uri || typeof uri !== "string" || !uri.startsWith("magnet:")) return uri;
   const qIndex = uri.indexOf("?");
@@ -114,17 +115,16 @@ function sanitizeMagnet(uri) {
     const k = p.substring(0, eq);
     let v = p.substring(eq + 1);
     if (k === "xt" || k === "x.pe") return k + "=" + v;
-    if (!/%[0-9A-Fa-f]{2}/.test(v)) {
-      try {
-        v = encodeURIComponent(decodeURIComponent(v));
-      } catch (e) {
-        v = encodeURIComponent(v);
-      }
+    try {
+      v = encodeURIComponent(decodeURIComponent(v));
+    } catch (e) {
+      v = encodeURIComponent(v);
     }
     return k + "=" + v;
   });
   return base + "?" + encoded.join("&");
 }
+// ─── END FIX 1 ───
 
 function xmlEscape(s) {
   return String(s ?? "")
@@ -620,7 +620,7 @@ function parseMagnetJson(text) {
   return JSON.parse(body);
 }
 
-// ─── STARA VERZIJA: direktni fetch (bez FlareSolverr) ───
+// ─── FIX 2: Direct fetch + FlareSolverr fallback ───
 async function postMagnetDirect({ id, ts, hmac, csrf, referer, cookies, userAgent }) {
   const postData = new URLSearchParams({
     torrent_id: id,
@@ -630,36 +630,66 @@ async function postMagnetDirect({ id, ts, hmac, csrf, referer, cookies, userAgen
     sessid: csrf
   }).toString();
 
-  const r = await fetch(normalizeBaseUrl(config.baseUrl) + "/ajax/getTorrentMagnet.php", {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "x-requested-with": "XMLHttpRequest",
-      "referer": referer,
-      "origin": normalizeBaseUrl(config.baseUrl),
-      "user-agent": userAgent,
-      "accept": "application/json, text/javascript, */*; q=0.01",
-      "cookie": cookiesToHeader(cookies)
-    },
-    body: postData
+  const targetUrl = normalizeBaseUrl(config.baseUrl) + "/ajax/getTorrentMagnet.php";
+
+  // Pokušaj 1: Direct fetch (brzo, radi ako Cloudflare ne blokira)
+  try {
+    const r = await fetch(targetUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "x-requested-with": "XMLHttpRequest",
+        "referer": referer,
+        "origin": normalizeBaseUrl(config.baseUrl),
+        "user-agent": userAgent,
+        "accept": "application/json, text/javascript, */*; q=0.01",
+        "cookie": cookiesToHeader(cookies)
+      },
+      body: postData
+    });
+
+    const text = await r.text();
+
+    if (!r.ok) {
+      throw new Error("HTTP " + r.status + ": " + text.slice(0, 200));
+    }
+
+    let json;
+    try {
+      json = parseMagnetJson(text);
+    } catch {
+      throw new Error("bad JSON: " + text.slice(0, 200));
+    }
+
+    return json;
+  } catch (e) {
+    warn("[magnet] direct fetch failed, using FlareSolverr fallback:", e.message || e);
+  }
+
+  // Pokušaj 2: FlareSolverr (sporo ali sigurno)
+  const fsRes = await fsCall({
+    cmd: "request.post",
+    url: targetUrl,
+    session: config.sessionName,
+    postData: postData,
+    maxTimeout: Number(config.requestTimeoutMs || 120000)
   });
 
-  const text = await r.text();
+  const solution = fsRes && fsRes.solution ? fsRes.solution : {};
+  const text = solution.response || "";
+
+  if (!text) throw new Error("magnet ajax empty response");
 
   let json;
   try {
     json = parseMagnetJson(text);
   } catch {
-    throw new Error("magnet ajax bad JSON: HTTP " + r.status + " " + text.slice(0, 300));
-  }
-
-  if (!r.ok) {
-    throw new Error("magnet ajax HTTP " + r.status + ": " + text.slice(0, 300));
+    throw new Error("magnet ajax bad JSON: " + text.slice(0, 300));
   }
 
   return json;
 }
-// ─── END STARA VERZIJA ───
+// ─── END FIX 2 ───
 
 async function fetchMagnetOnce(relPath, id) {
   await ensureSession();
@@ -705,6 +735,7 @@ async function fetchMagnet(relPath, id) {
   }
 }
 
+// ─── FIX 3: isBrowser logika (302 za browser, 200 za torrent klijente) ───
 async function handleDownload(req, res, u) {
   const id = u.searchParams.get("id") || "";
   const relPath = u.searchParams.get("path") || "";
@@ -713,40 +744,66 @@ async function handleDownload(req, res, u) {
     return send(res, 400, "text/plain; charset=utf-8", "bad download parameters");
   }
 
-  const cached = getCache(magnetCache, id);
-  if (cached) {
-    log("[cache] magnet hit", id);
-    res.writeHead(302, {
-      Location: sanitizeMagnet(cached),
-      "cache-control": "private, max-age=86400"
-    });
-    return res.end();
-  }
+  const accept = String(req.headers.accept || "").toLowerCase();
+  const isBrowser = accept.includes("text/html") && !accept.includes("application/x-bittorrent");
 
-  const magnet = await withFsLock(async () => {
-    const cachedAgain = getCache(magnetCache, id);
-    if (cachedAgain) {
-      log("[cache] magnet hit after wait", id);
-      return cachedAgain;
+  const cached = getCache(magnetCache, id);
+
+  async function getMagnetString() {
+    if (cached) {
+      log("[cache] magnet hit", id);
+      return sanitizeMagnet(cached);
     }
 
-    log("[flaresolverr] magnet fetch", id);
-    const m = await fetchMagnet(relPath, id);
+    return await withFsLock(async () => {
+      const cachedAgain = getCache(magnetCache, id);
+      if (cachedAgain) {
+        log("[cache] magnet hit after wait", id);
+        return sanitizeMagnet(cachedAgain);
+      }
 
-    setLimitedCache(magnetCache, id, m,
-      Number(config.maxMagnetCacheItems || 1000),
-      Number(config.magnetTtlMinutes || 1440) * 60 * 1000);
+      log("[flaresolverr] magnet fetch", id);
+      const m = await fetchMagnet(relPath, id);
 
-    log("[cache] magnet stored", id);
-    return m;
-  });
+      setLimitedCache(magnetCache, id, m,
+        Number(config.maxMagnetCacheItems || 1000),
+        Number(config.magnetTtlMinutes || 1440) * 60 * 1000);
 
-  res.writeHead(302, {
-    Location: sanitizeMagnet(magnet),
-    "cache-control": "private, max-age=86400"
-  });
-  res.end();
+      log("[cache] magnet stored", id);
+      return sanitizeMagnet(m);
+    });
+  }
+
+  try {
+    const safeMagnet = await getMagnetString();
+
+    if (!safeMagnet || !safeMagnet.startsWith("magnet:")) {
+      return send(res, 500, "text/plain; charset=utf-8", "invalid magnet");
+    }
+
+    log("[download] id=", id, "accept=", accept, "browser=", isBrowser);
+
+    if (isBrowser) {
+      res.writeHead(302, {
+        Location: safeMagnet,
+        "cache-control": "private, max-age=86400"
+      });
+      return res.end();
+    }
+
+    const body = safeMagnet;
+    res.writeHead(200, {
+      "content-type": "application/x-bittorrent",
+      "content-length": Buffer.byteLength(body),
+      "cache-control": "private, max-age=86400"
+    });
+    return res.end(body);
+  } catch (e) {
+    error("[download] failed for id=", id, e.message || e);
+    return send(res, 500, "text/plain; charset=utf-8", String(e.message || e));
+  }
 }
+// ─── END FIX 3 ───
 
 async function doWarm() {
   const start = Date.now();
